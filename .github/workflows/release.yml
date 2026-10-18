@@ -12,6 +12,7 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
@@ -42,8 +43,9 @@ jobs:
           mkv2mp4 -e x264 t/src t/dst
           test -f t/dst/Show/test.mp4
           test -f t/src/Show/test.converted.mkv
-          ffprobe -v error -show_entries stream=codec_name -of csv=p=0 t/dst/Show/test.mp4 | tee /dev/stderr \
-            | tr '\n' ' ' | grep -q '^h264 aac ac3 $'
+          codecs=$(ffprobe -v error -show_entries stream=codec_name -of default=nw=1:nk=1 t/dst/Show/test.mp4 | xargs)
+          echo "output streams: $codecs"
+          [ "$codecs" = "h264 aac ac3" ]
 
   release:
     needs: test
