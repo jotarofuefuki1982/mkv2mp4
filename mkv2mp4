@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 H264_OK_PROFILES = {"baseline", "constrained baseline", "main", "high"}
 H264_OK_PIXFMTS = {"yuv420p", "yuvj420p"}
@@ -283,6 +283,11 @@ def try_ffmpeg(cmd: List[str]) -> bool:
         return False
 
 
+def videotoolbox_quality(q: int) -> int:
+    """Map the CRF-style --quality (lower is better) to VideoToolbox's 1-100 (higher is better)."""
+    return max(1, min(100, 100 - 2 * q))
+
+
 def detect_encoder(choice: str, vaapi_device: str) -> str:
     test_src = ["-f", "lavfi", "-i", "color=black:s=320x240:r=25:d=0.2"]
     base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
@@ -290,6 +295,9 @@ def detect_encoder(choice: str, vaapi_device: str) -> str:
         "nvenc": base + test_src + ["-c:v", "h264_nvenc", "-f", "null", "-"],
         "vaapi": base + ["-init_hw_device", f"vaapi=va:{vaapi_device}", "-filter_hw_device", "va"]
         + test_src + ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f", "null", "-"],
+        # Constant-quality mode (-q:v) needs Apple Silicon; Intel Macs fall back to x264.
+        "videotoolbox": base + test_src + ["-pix_fmt", "yuv420p", "-c:v", "h264_videotoolbox",
+                                           "-q:v", "60", "-f", "null", "-"],
     }
     if choice == "x264":
         return "x264"
@@ -297,7 +305,7 @@ def detect_encoder(choice: str, vaapi_device: str) -> str:
         if not try_ffmpeg(checks[choice]):
             raise RuntimeError(f"encoder '{choice}' is not usable on this machine")
         return choice
-    for name in ("nvenc", "vaapi"):
+    for name in ("videotoolbox",) if sys.platform == "darwin" else ("nvenc", "vaapi"):
         if try_ffmpeg(checks[name]):
             return name
     return "x264"
@@ -361,6 +369,8 @@ def build_command(plan: Plan, encoder: str, args) -> List[str]:
         elif encoder == "nvenc":
             cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
                     "-rc", "vbr", "-cq", q, "-b:v", "0"]
+        elif encoder == "videotoolbox":
+            cmd += ["-c:v", "h264_videotoolbox", "-q:v", str(videotoolbox_quality(args.quality))]
         else:
             cmd += ["-c:v", "h264_vaapi", "-rc_mode", "CQP", "-qp", q]
         cmd += ["-profile:v", "high"]
@@ -551,11 +561,13 @@ def parse_args(argv=None):
     p.add_argument("dest", type=Path, help="directory to write the .mp4 files into")
     p.add_argument("-n", "--dry-run", action="store_true", help="show what would happen, convert nothing")
     p.add_argument("-j", "--jobs", type=int, default=1, help="files to convert in parallel (default 1)")
-    p.add_argument("-e", "--encoder", choices=["auto", "vaapi", "nvenc", "x264"], default="auto",
-                   help="video encoder (default auto: NVENC, then VAAPI, then CPU x264)")
+    p.add_argument("-e", "--encoder", choices=["auto", "vaapi", "nvenc", "videotoolbox", "x264"],
+                   default="auto", help="video encoder (default auto: NVENC, then VAAPI, then CPU x264; "
+                                        "on macOS VideoToolbox, then x264)")
     p.add_argument("--vaapi-device", default="/dev/dri/renderD128", help="VAAPI render node")
     p.add_argument("-q", "--quality", type=int, default=20,
-                   help="video quality, lower is better/bigger: x264 CRF, NVENC CQ, VAAPI QP (default 20)")
+                   help="video quality, lower is better/bigger: x264 CRF, NVENC CQ, VAAPI QP; "
+                        "VideoToolbox uses 100-2N (default 20)")
     p.add_argument("--preset", default="medium", help="x264 preset (default medium)")
     p.add_argument("--max-height", type=int, metavar="PX",
                    help="downscale taller video, e.g. 1080 (forces re-encode of 4K)")
@@ -576,8 +588,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
-            print(f"error: {tool} not found. Install it: sudo apt install ffmpeg  /  sudo pacman -S ffmpeg",
-                  file=sys.stderr)
+            print(f"error: {tool} not found. Install it: sudo apt install ffmpeg  /  sudo pacman -S ffmpeg"
+                  "  /  brew install ffmpeg", file=sys.stderr)
             return 2
     source = args.source.expanduser().resolve()
     dest = args.dest.expanduser().resolve()

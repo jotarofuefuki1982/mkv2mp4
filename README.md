@@ -28,8 +28,8 @@ Subfolders are mirrored, so `Show/Season 01/Show S01E01.mkv` becomes
 | Subtitles | Text subtitles (SRT/ASS/WebVTT) are embedded as MP4 text tracks, or written as sidecar files with `--external-subs`. Image subtitles (PGS/VobSub) can't be stored in MP4 and are dropped unless you use `--burn-subs`. |
 | Other | Chapters and metadata are kept. Faststart is enabled so playback starts instantly. |
 
-Encoding uses the GPU when one is available (NVIDIA NVENC, then Intel/AMD VAAPI),
-otherwise the CPU (x264). Run with `--dry-run` first to see exactly what will
+Encoding uses the GPU when one is available (NVIDIA NVENC, then Intel/AMD VAAPI;
+VideoToolbox on Apple Silicon Macs), otherwise the CPU (x264). Run with `--dry-run` first to see exactly what will
 happen to each file.
 
 ## Install
@@ -46,14 +46,24 @@ cd packaging/arch && makepkg -si
 
 ```
 ./packaging/debian/build-deb.sh
-sudo apt install ./dist/mkv2mp4_1.0.0_all.deb
+sudo apt install ./dist/mkv2mp4_*_all.deb
 ```
+
+**macOS** (needs [Homebrew](https://brew.sh))
+
+```
+./install.sh                   # ffmpeg via Homebrew, then asks for sudo to install to /usr/local/bin
+./install.sh --uninstall
+```
+
+The Python 3 that comes with Apple's developer tools (which Homebrew installs)
+is enough.
 
 **Any distro (simple script)**
 
 ```
-sudo ./install.sh              # installs to /usr/local/bin, and ffmpeg via pacman/apt
-sudo ./install.sh --uninstall
+./install.sh                   # installs to /usr/local/bin, and ffmpeg via pacman/apt
+./install.sh --uninstall
 ```
 
 ### GPU encoding (optional but much faster)
@@ -63,6 +73,9 @@ sudo ./install.sh --uninstall
   `mesa-va-drivers` (AMD) or `intel-media-va-driver` (Intel).
 * **Arch:** AMD works out of the box with mesa. Intel needs `intel-media-driver`
   (or `libva-intel-driver` on pre-Broadwell chips).
+* **macOS:** Apple Silicon Macs use the VideoToolbox hardware encoder
+  automatically; nothing to install. Intel Macs use x264 (VideoToolbox's
+  constant-quality mode, which mkv2mp4 relies on, needs Apple Silicon).
 * **Mac Pro running Ubuntu:** the AMD FirePro/Radeon cards may or may not expose
   a VAAPI H.264 encoder depending on generation. mkv2mp4 tests this at startup
   and falls back to x264 if needed. The Xeon CPUs are fast at x264, so try
@@ -79,8 +92,9 @@ mkv2mp4 SOURCE DEST [options]
 
   -n, --dry-run         show the plan for every file, convert nothing
   -j, --jobs N          convert N files in parallel (default 1)
-  -e, --encoder E       auto | vaapi | nvenc | x264   (default auto)
-  -q, --quality N       lower = better/bigger. x264 CRF / NVENC CQ / VAAPI QP (default 20)
+  -e, --encoder E       auto | vaapi | nvenc | videotoolbox | x264   (default auto)
+  -q, --quality N       lower = better/bigger. x264 CRF / NVENC CQ / VAAPI QP;
+                        VideoToolbox quality is 100 - 2N (default 20)
       --preset P        x264 preset (default medium; slower = smaller files)
       --max-height PX   downscale taller video, e.g. 1080 (old Fire Sticks/Rokus
                         can't play 4K H.264)

@@ -1,10 +1,13 @@
-# Push a tag like v1.0.0 (matching __version__ in mkv2mp4) to build the .deb,
-# install-test it on Ubuntu 22.04 and 24.04, and publish a GitHub release.
+# Pushes to main run the tests: build and install the .deb on Ubuntu 22.04 and
+# 24.04, run install.sh on macOS, and convert a file with each. Push a tag like
+# v1.0.0 (matching __version__ in mkv2mp4) to also publish a GitHub release.
 name: release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,6 +23,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Tag matches version
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           v=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' mkv2mp4)
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != __version__ $v"; exit 1; }
@@ -47,8 +51,45 @@ jobs:
           echo "output streams: $codecs"
           [ "$codecs" = "h264 aac ac3" ]
 
+  test-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install with install.sh
+        run: |
+          ./install.sh
+          mkv2mp4 --version
+          man -w mkv2mp4
+
+      # Auto picks VideoToolbox if this machine has it, else x264; test both
+      # VideoToolbox explicitly (when available) and the CPU fallback.
+      - name: Convert a test file
+        run: |
+          check() {
+            rm -rf t && mkdir -p t/src/Show t/dst
+            ffmpeg -v error -f lavfi -i testsrc2=s=640x360:r=24:d=2 \
+              -f lavfi -i "sine=d=2,aformat=channel_layouts=5.1" \
+              -c:v libx265 -pix_fmt yuv420p10le -c:a flac t/src/Show/test.mkv
+            mkv2mp4 "$@" t/src t/dst | tee out.txt
+            grep "video encoder" out.txt
+            test -f t/dst/Show/test.mp4
+            test -f t/src/Show/test.converted.mkv
+            codecs=$(ffprobe -v error -show_entries stream=codec_name -of default=nw=1:nk=1 t/dst/Show/test.mp4 | xargs)
+            echo "output streams: $codecs"
+            [ "$codecs" = "h264 aac ac3" ]
+          }
+          check
+          check -e x264
+          if mkv2mp4 -n -e videotoolbox t/src t/dst >/dev/null 2>&1; then
+            check -e videotoolbox
+          else
+            echo "::notice::VideoToolbox H.264 is not available on this runner; only x264 was tested"
+          fi
+
   release:
-    needs: test
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test, test-macos]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -78,7 +119,15 @@ jobs:
           cd mkv2mp4/packaging/arch && makepkg -si
           \`\`\`
 
-          Tested by installing the .deb and converting a file on Ubuntu 22.04 and 24.04.
+          ## Install on macOS (needs Homebrew)
+
+          \`\`\`
+          git clone https://github.com/$GITHUB_REPOSITORY.git
+          cd mkv2mp4 && ./install.sh
+          \`\`\`
+
+          Tested by installing the .deb and converting a file on Ubuntu 22.04 and 24.04,
+          and by installing with install.sh and converting a file on macOS 15.
           EOF
           gh release create "$GITHUB_REF_NAME" "dist/$deb" \
             --title "mkv2mp4 ${GITHUB_REF_NAME#v}" --notes-file notes.md

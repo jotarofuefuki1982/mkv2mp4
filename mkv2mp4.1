@@ -1,4 +1,4 @@
-.TH MKV2MP4 1 "October 2026" "mkv2mp4 1.0.0" "User Commands"
+.TH MKV2MP4 1 "October 2026" "mkv2mp4 1.1.0" "User Commands"
 .SH NAME
 mkv2mp4 \- convert MKV files into MP4s that every Jellyfin client can direct play
 .SH SYNOPSIS
@@ -87,11 +87,12 @@ files in parallel (default 1). Live progress is shown only when
 .I N
 is 1.
 .TP
-.BR \-e ", " \-\-encoder " \fIauto\fR|\fIvaapi\fR|\fInvenc\fR|\fIx264\fR"
+.BR \-e ", " \-\-encoder " \fIauto\fR|\fIvaapi\fR|\fInvenc\fR|\fIvideotoolbox\fR|\fIx264\fR"
 Video encoder. The default,
 .BR auto ,
 test-encodes at startup and picks NVIDIA NVENC, then VAAPI (Intel/AMD), then
-the CPU encoder x264. Naming a GPU encoder that doesn't work is an error.
+the CPU encoder x264. On macOS it picks VideoToolbox, then x264. Naming a GPU
+encoder that doesn't work is an error.
 .TP
 .BI \-\-vaapi\-device " path"
 VAAPI render node (default
@@ -99,7 +100,8 @@ VAAPI render node (default
 .TP
 .BR \-q ", " \-\-quality " \fIN\fR"
 Video quality. Lower is better and bigger. Used as the CRF for x264, CQ for
-NVENC and QP for VAAPI (default 20). Sensible range is 18\(en24.
+NVENC and QP for VAAPI; VideoToolbox gets a quality of 100 \(mi 2\fIN\fR
+(default 20). Sensible range is 18\(en24.
 .TP
 .BI \-\-preset " name"
 x264 preset (default
@@ -186,6 +188,11 @@ AMD works with mesa. Intel needs
 .B libva\-intel\-driver
 for pre-Broadwell chips). NVIDIA needs
 .BR nvidia\-utils .
+.TP
+.B macOS
+Apple Silicon Macs use the VideoToolbox hardware encoder with nothing extra to
+install. Intel Macs fall back to x264, because VideoToolbox's constant-quality
+mode needs Apple Silicon.
 .PP
 The encoder chosen is shown at the start of every run.
 .SH EXIT STATUS
