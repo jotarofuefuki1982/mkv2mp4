@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""mkv2mp4 - convert MKV files into MP4s that every Jellyfin client can direct play.
+
+For each .mkv in SOURCE, writes DEST/<same relative path>/<name>.mp4 and, once the
+conversion has succeeded, renames the original to <name>.converted.mkv so later runs
+skip it. Originals are never deleted.
+
+Target format (plays without server transcoding on browsers, Roku, Fire TV,
+Apple TV, Android TV):
+  video     H.264 8-bit 4:2:0. Already-compatible H.264 is copied untouched;
+            anything else (HEVC, 10-bit, AV1, MPEG-2, VC-1...) is re-encoded.
+            HDR is tone-mapped to SDR, interlaced video is deinterlaced.
+  audio     First track is AAC stereo (default). AAC/AC3/E-AC3/MP3 tracks are
+            copied; other surround tracks (DTS, TrueHD, FLAC...) become AC3 5.1.
+  subtitles Text subtitles become MP4 text tracks (or sidecar files with
+            --external-subs). Image subtitles (PGS/VobSub) can't live in MP4;
+            they are dropped unless --burn-subs is given.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional
+
+__version__ = "1.0.0"
+
+H264_OK_PROFILES = {"baseline", "constrained baseline", "main", "high"}
+H264_OK_PIXFMTS = {"yuv420p", "yuvj420p"}
+AUDIO_COPY_CODECS = {"aac", "ac3", "eac3", "mp3"}
+TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+IMAGE_SUB_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
+HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
+INTERLACED_ORDERS = {"tt", "bb", "tb", "bt"}
+COVER_ART_CODECS = {"mjpeg", "png", "bmp", "gif"}
+
+TONEMAP_CHAIN = (
+    "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+    "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv"
+)
+
+
+# ----------------------------------------------------------------------------- output
+
+class Out:
+    """Console + log file output, safe to call from worker threads."""
+
+    def __init__(self, log_path: Optional[Path]):
+        self.lock = threading.Lock()
+        self.tty = sys.stdout.isatty()
+        self.color = self.tty and not os.environ.get("NO_COLOR")
+        self.progress_shown = False
+        self.log = None
+        if log_path:
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                self.log = open(log_path, "a", encoding="utf-8")
+            except OSError as e:
+                print(f"warning: can't open log file {log_path}: {e}", file=sys.stderr)
+
+    def _paint(self, text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.color else text
+
+    def _write_log(self, text: str) -> None:
+        if self.log:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            for line in text.splitlines() or [""]:
+                self.log.write(f"{stamp} {line}\n")
+            self.log.flush()
+
+    def _clear_progress(self) -> None:
+        if self.progress_shown:
+            sys.stdout.write("\r\033[K")
+            self.progress_shown = False
+
+    def say(self, text: str = "", style: str = "", log: bool = True) -> None:
+        codes = {"ok": "32", "warn": "33", "err": "31", "dim": "2", "bold": "1"}
+        with self.lock:
+            self._clear_progress()
+            print(self._paint(text, codes[style]) if style else text, flush=True)
+            if log:
+                self._write_log(text)
+
+    def log_only(self, text: str) -> None:
+        with self.lock:
+            self._write_log(text)
+
+    def progress(self, text: str) -> None:
+        if not self.tty:
+            return
+        with self.lock:
+            width = shutil.get_terminal_size((80, 20)).columns
+            sys.stdout.write("\r\033[K" + text[: width - 1])
+            sys.stdout.flush()
+            self.progress_shown = True
+
+
+# ----------------------------------------------------------------------------- probing
+
+def ffprobe(path: Path) -> dict:
+    res = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip() or "ffprobe failed")
+    return json.loads(res.stdout)
+
+
+def parse_duration(info: dict) -> float:
+    try:
+        return float(info["format"]["duration"])
+    except (KeyError, ValueError):
+        pass
+    for s in info.get("streams", []):
+        tag = (s.get("tags") or {}).get("DURATION")
+        if tag:
+            h, m, sec = tag.split(":")
+            return int(h) * 3600 + int(m) * 60 + float(sec)
+    return 0.0
+
+
+def lang_of(stream: dict) -> str:
+    return (stream.get("tags") or {}).get("language", "und")
+
+
+def disp(stream: dict, key: str) -> bool:
+    return bool((stream.get("disposition") or {}).get(key))
+
+
+# ----------------------------------------------------------------------------- planning
+
+@dataclass
+class AudioOut:
+    index: int          # absolute input stream index
+    action: str         # copy | stereo | ac3 | aac
+    desc: str
+    channels: int = 2
+
+
+@dataclass
+class SubOut:
+    index: int
+    codec: str
+    lang: str
+    forced: bool
+    default: bool
+
+
+@dataclass
+class Plan:
+    src: Path
+    dst: Path
+    renamed: Path
+    duration: float = 0.0
+    video_index: int = -1
+    video_encode: bool = False
+    video_desc: str = ""
+    tonemap: bool = False
+    deinterlace: bool = False
+    scale_to: Optional[int] = None
+    audio: List[AudioOut] = field(default_factory=list)
+    subs: List[SubOut] = field(default_factory=list)
+    burn_index: Optional[int] = None
+    notes: List[str] = field(default_factory=list)
+
+
+def describe_audio(s: dict) -> str:
+    ch = s.get("channels", 0)
+    layout = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}.get(ch, f"{ch}ch")
+    return f"#{s['index']} {lang_of(s)} {s.get('codec_name', '?')} {layout}"
+
+
+def make_plan(src: Path, dst: Path, info: dict, args, has_zscale: bool) -> Plan:
+    plan = Plan(src=src, dst=dst, renamed=src.with_name(src.stem + ".converted" + src.suffix))
+    plan.duration = parse_duration(info)
+    streams = info.get("streams", [])
+
+    # --- video
+    videos = [
+        s for s in streams
+        if s.get("codec_type") == "video"
+        and not disp(s, "attached_pic")
+        and s.get("codec_name") not in COVER_ART_CODECS
+    ]
+    if not videos:
+        raise RuntimeError("no video stream found")
+    v = next((s for s in videos if disp(s, "default")), videos[0])
+    plan.video_index = v["index"]
+    codec = v.get("codec_name", "?")
+    profile = (v.get("profile") or "").lower()
+    pix_fmt = v.get("pix_fmt", "")
+    height = int(v.get("height") or 0)
+
+    reasons = []
+    if codec != "h264":
+        reasons.append(codec.upper())
+    elif profile not in H264_OK_PROFILES:
+        reasons.append(f"H.264 {v.get('profile')}")
+    elif pix_fmt not in H264_OK_PIXFMTS:
+        reasons.append(pix_fmt)
+
+    if v.get("color_transfer") in HDR_TRANSFERS:
+        reasons.append("HDR")
+        if has_zscale:
+            plan.tonemap = True
+        else:
+            plan.notes.append("HDR source but this ffmpeg lacks zscale: colours will look washed out")
+    if v.get("field_order") in INTERLACED_ORDERS:
+        plan.deinterlace = True
+        reasons.append("interlaced")
+    if args.max_height and height > args.max_height:
+        plan.scale_to = args.max_height
+        reasons.append(f"{height}p > {args.max_height}p")
+
+    # --- subtitles (decided before video because burning forces an encode)
+    sub_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
+    image_subs = [s for s in sub_streams if s.get("codec_name") in IMAGE_SUB_CODECS]
+    if args.burn_subs and image_subs:
+        burn = (next((s for s in image_subs if disp(s, "forced")), None)
+                or next((s for s in image_subs if disp(s, "default")), None)
+                or image_subs[0])
+        plan.burn_index = burn["index"]
+        reasons.append(f"burning subs #{burn['index']}")
+
+    for s in sub_streams:
+        c = s.get("codec_name", "?")
+        if c in TEXT_SUB_CODECS:
+            plan.subs.append(SubOut(s["index"], c, lang_of(s), disp(s, "forced"), disp(s, "default")))
+        elif s["index"] != plan.burn_index:
+            plan.notes.append(f"dropping subtitle #{s['index']} {lang_of(s)} ({c}, image-based)")
+
+    plan.video_encode = bool(reasons)
+    label = f"{codec.upper()} {v.get('profile', '')}".strip()
+    if plan.video_encode:
+        plan.video_desc = f"encode -> H.264  ({', '.join(reasons)})"
+    else:
+        plan.video_desc = f"copy  ({label}, {height}p)"
+
+    # --- audio
+    audios = [s for s in streams if s.get("codec_type") == "audio"]
+    if not audios:
+        plan.notes.append("no audio streams")
+    else:
+        primary = next((s for s in audios if disp(s, "default")), audios[0])
+        primary_is_aac_stereo = primary.get("codec_name") == "aac" and primary.get("channels", 0) <= 2
+        if primary_is_aac_stereo:
+            plan.audio.append(AudioOut(primary["index"], "copy", f"{describe_audio(primary)} -> copy (default)"))
+        else:
+            plan.audio.append(AudioOut(primary["index"], "stereo",
+                                       f"{describe_audio(primary)} -> AAC stereo (default)"))
+        for s in audios:
+            ch = s.get("channels", 0)
+            c = s.get("codec_name")
+            if s is primary and (primary_is_aac_stereo or (ch <= 2 and c not in AUDIO_COPY_CODECS)):
+                continue  # already fully represented by the stereo track
+            if c in AUDIO_COPY_CODECS:
+                plan.audio.append(AudioOut(s["index"], "copy", f"{describe_audio(s)} -> copy"))
+            elif ch > 2:
+                layout = "5.1" if ch >= 6 else f"{ch}ch"
+                plan.audio.append(AudioOut(s["index"], "ac3", f"{describe_audio(s)} -> AC3 {layout}", ch))
+            else:
+                plan.audio.append(AudioOut(s["index"], "aac", f"{describe_audio(s)} -> AAC"))
+    return plan
+
+
+# ----------------------------------------------------------------------------- encoders
+
+def try_ffmpeg(cmd: List[str]) -> bool:
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def detect_encoder(choice: str, vaapi_device: str) -> str:
+    test_src = ["-f", "lavfi", "-i", "color=black:s=320x240:r=25:d=0.2"]
+    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    checks = {
+        "nvenc": base + test_src + ["-c:v", "h264_nvenc", "-f", "null", "-"],
+        "vaapi": base + ["-init_hw_device", f"vaapi=va:{vaapi_device}", "-filter_hw_device", "va"]
+        + test_src + ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f", "null", "-"],
+    }
+    if choice == "x264":
+        return "x264"
+    if choice in checks:
+        if not try_ffmpeg(checks[choice]):
+            raise RuntimeError(f"encoder '{choice}' is not usable on this machine")
+        return choice
+    for name in ("nvenc", "vaapi"):
+        if try_ffmpeg(checks[name]):
+            return name
+    return "x264"
+
+
+def has_filter(name: str) -> bool:
+    res = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True)
+    return any(line.split()[1:2] == [name] for line in res.stdout.splitlines())
+
+
+# ----------------------------------------------------------------------------- command
+
+def part_path(p: Path) -> Path:
+    return p.with_name(f".{p.name}.part")
+
+
+def sidecar_paths(plan: Plan) -> List[Path]:
+    paths, used = [], set()
+    for s in plan.subs:
+        ext = "ass" if s.codec in ("ass", "ssa") else "srt"
+        tags = s.lang + (".forced" if s.forced else "") + (".default" if s.default else "")
+        name, n = f"{plan.dst.stem}.{tags}.{ext}", 2
+        while name in used:
+            name = f"{plan.dst.stem}.{tags}.{n}.{ext}"
+            n += 1
+        used.add(name)
+        paths.append(plan.dst.with_name(name))
+    return paths
+
+
+def build_command(plan: Plan, encoder: str, args) -> List[str]:
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
+           "-progress", "pipe:1", "-nostats"]
+    if plan.video_encode and encoder == "vaapi":
+        cmd += ["-init_hw_device", f"vaapi=va:{args.vaapi_device}", "-filter_hw_device", "va"]
+    cmd += ["-i", str(plan.src)]
+
+    # --- video
+    if plan.video_encode:
+        pre = []
+        if plan.deinterlace:
+            pre.append("bwdif=mode=send_frame:deint=interlaced")
+        if plan.tonemap:
+            pre.append(TONEMAP_CHAIN)
+        post = []
+        if plan.scale_to:
+            post.append(f"scale=-2:{plan.scale_to}:flags=lanczos")
+        post.append("format=nv12,hwupload" if encoder == "vaapi" else "format=yuv420p")
+
+        graph = f"[0:{plan.video_index}]{','.join(pre) or 'null'}[v0]"
+        cur = "[v0]"
+        if plan.burn_index is not None:
+            graph += f";{cur}[0:{plan.burn_index}]overlay[v1]"
+            cur = "[v1]"
+        graph += f";{cur}{','.join(post)}[vout]"
+        cmd += ["-filter_complex", graph, "-map", "[vout]"]
+
+        q = str(args.quality)
+        if encoder == "x264":
+            cmd += ["-c:v", "libx264", "-preset", args.preset, "-crf", q]
+        elif encoder == "nvenc":
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+                    "-rc", "vbr", "-cq", q, "-b:v", "0"]
+        else:
+            cmd += ["-c:v", "h264_vaapi", "-rc_mode", "CQP", "-qp", q]
+        cmd += ["-profile:v", "high"]
+        if plan.tonemap:
+            cmd += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+    else:
+        cmd += ["-map", f"0:{plan.video_index}", "-c:v", "copy"]
+    cmd += ["-tag:v", "avc1"]
+
+    # --- audio
+    for i, a in enumerate(plan.audio):
+        cmd += ["-map", f"0:{a.index}"]
+        if a.action == "copy":
+            cmd += [f"-c:a:{i}", "copy"]
+        elif a.action == "stereo":
+            cmd += [f"-c:a:{i}", "aac", f"-ac:a:{i}", "2", f"-b:a:{i}", "192k",
+                    f"-metadata:s:a:{i}", "title=Stereo (AAC)"]
+        elif a.action == "aac":
+            cmd += [f"-c:a:{i}", "aac", f"-b:a:{i}", "192k",
+                    f"-metadata:s:a:{i}", "title=Stereo (AAC)"]
+        else:  # ac3
+            cmd += [f"-c:a:{i}", "ac3", f"-b:a:{i}", "640k",
+                    f"-metadata:s:a:{i}", "title=Surround (AC3)"]
+            if a.channels > 6:  # AC3 tops out at 5.1
+                cmd += [f"-ac:a:{i}", "6"]
+        cmd += [f"-disposition:a:{i}", "default" if i == 0 else "0"]
+
+    # --- embedded text subtitles
+    if not args.external_subs:
+        for i, s in enumerate(plan.subs):
+            cmd += ["-map", f"0:{s.index}", f"-c:s:{i}", "mov_text"]
+
+    cmd += ["-map_metadata", "0", "-map_chapters", "0", "-max_muxing_queue_size", "9999",
+            "-movflags", "+faststart", "-f", "mp4", str(part_path(plan.dst))]
+
+    # --- sidecar subtitle outputs
+    if args.external_subs:
+        for s, path in zip(plan.subs, sidecar_paths(plan)):
+            fmt = path.suffix[1:]
+            cmd += ["-map", f"0:{s.index}", "-c:s", fmt, "-f", fmt, str(part_path(path))]
+    return cmd
+
+
+# ----------------------------------------------------------------------------- running
+
+def fmt_time(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def fmt_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+class Runner:
+    def __init__(self, args, encoder: str, out: Out, total: int):
+        self.args = args
+        self.encoder = encoder
+        self.out = out
+        self.total = total
+        self.stop = threading.Event()
+        self.procs = set()
+        self.lock = threading.Lock()
+
+    def kill_all(self) -> None:
+        self.stop.set()
+        with self.lock:
+            for p in self.procs:
+                try:
+                    p.terminate()
+                except OSError:
+                    pass
+
+    def run(self, n: int, plan: Plan) -> str:
+        """Convert one file. Returns 'remuxed', 'encoded', 'failed' or 'stopped'."""
+        if self.stop.is_set():
+            return "stopped"
+        tag = f"[{n}/{self.total}]"
+        name = plan.src.name
+        mode = "encoding" if plan.video_encode else "remuxing"
+        self.out.say(f"{tag} {mode} {name}")
+
+        plan.dst.parent.mkdir(parents=True, exist_ok=True)
+        outputs = [plan.dst] + (sidecar_paths(plan) if self.args.external_subs else [])
+        cmd = build_command(plan, self.encoder, self.args)
+        self.out.log_only("  $ " + subprocess.list2cmdline(cmd))
+
+        start = time.time()
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        with self.lock:
+            self.procs.add(proc)
+        errors = collections.deque(maxlen=40)
+        err_thread = threading.Thread(target=lambda: errors.extend(proc.stderr), daemon=True)
+        err_thread.start()
+
+        speed, last = "", 0.0
+        show_progress = self.args.jobs == 1
+        for line in proc.stdout:
+            key, _, val = line.strip().partition("=")
+            if key == "speed":
+                speed = val
+            elif key == "out_time_us" and show_progress and plan.duration > 0:
+                now = time.time()
+                if now - last < 0.5:
+                    continue
+                last = now
+                try:
+                    done = int(val) / 1e6
+                except ValueError:
+                    continue
+                pct = min(done / plan.duration, 1.0)
+                elapsed = now - start
+                eta = elapsed / pct - elapsed if pct > 0.01 else 0
+                self.out.progress(f"    {pct * 100:5.1f}%  speed {speed or '?'}  "
+                                  f"ETA {fmt_time(eta) if eta else '--:--'}  {name}")
+        rc = proc.wait()
+        err_thread.join(timeout=5)
+        with self.lock:
+            self.procs.discard(proc)
+
+        if rc != 0 or self.stop.is_set():
+            for p in outputs:
+                try:
+                    part_path(p).unlink()
+                except FileNotFoundError:
+                    pass
+            if self.stop.is_set():
+                return "stopped"
+            self.out.say(f"{tag} FAILED {name} (ffmpeg exit {rc})", "err")
+            for e in errors:
+                self.out.say(f"      {e.rstrip()}", "dim")
+            return "failed"
+
+        for p in outputs:
+            os.replace(part_path(p), p)
+        took = time.time() - start
+        size = plan.dst.stat().st_size
+        self.out.say(f"{tag} done {plan.dst.name}  {fmt_size(size)} in {fmt_time(took)}", "ok")
+
+        if not self.args.no_rename:
+            if plan.renamed.exists():
+                self.out.say(f"      not renaming original: {plan.renamed.name} already exists", "warn")
+            else:
+                try:
+                    plan.src.rename(plan.renamed)
+                except OSError as e:
+                    self.out.say(f"      couldn't rename original: {e}", "warn")
+        return "encoded" if plan.video_encode else "remuxed"
+
+
+# ----------------------------------------------------------------------------- discovery
+
+def find_sources(source: Path, recursive: bool) -> List[Path]:
+    if source.is_file():
+        return [source]
+    pattern = source.rglob("*") if recursive else source.glob("*")
+    found = []
+    for p in pattern:
+        rel = p.relative_to(source)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        name = p.name.lower()
+        if name.endswith(".mkv") and not name.endswith(".converted.mkv") and p.is_file():
+            found.append(p)
+    return sorted(found, key=lambda p: str(p).lower())
+
+
+def default_log_path() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "mkv2mp4" / "mkv2mp4.log"
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        prog="mkv2mp4",
+        description="Convert .mkv files into MP4s that every Jellyfin client can direct play.",
+        epilog="After a successful conversion the original is renamed to <name>.converted.mkv "
+               "(never deleted). Files already named *.converted.mkv are skipped.",
+    )
+    p.add_argument("source", type=Path, help="directory to scan for .mkv files (or a single .mkv)")
+    p.add_argument("dest", type=Path, help="directory to write the .mp4 files into")
+    p.add_argument("-n", "--dry-run", action="store_true", help="show what would happen, convert nothing")
+    p.add_argument("-j", "--jobs", type=int, default=1, help="files to convert in parallel (default 1)")
+    p.add_argument("-e", "--encoder", choices=["auto", "vaapi", "nvenc", "x264"], default="auto",
+                   help="video encoder (default auto: NVENC, then VAAPI, then CPU x264)")
+    p.add_argument("--vaapi-device", default="/dev/dri/renderD128", help="VAAPI render node")
+    p.add_argument("-q", "--quality", type=int, default=20,
+                   help="video quality, lower is better/bigger: x264 CRF, NVENC CQ, VAAPI QP (default 20)")
+    p.add_argument("--preset", default="medium", help="x264 preset (default medium)")
+    p.add_argument("--max-height", type=int, metavar="PX",
+                   help="downscale taller video, e.g. 1080 (forces re-encode of 4K)")
+    p.add_argument("--external-subs", action="store_true",
+                   help="write text subtitles as sidecar .srt/.ass files instead of embedding")
+    p.add_argument("--burn-subs", action="store_true",
+                   help="burn one image subtitle (forced, else default, else first) into the video")
+    p.add_argument("--no-rename", action="store_true", help="leave the original filenames alone")
+    p.add_argument("--overwrite", action="store_true", help="replace existing .mp4 files in DEST")
+    p.add_argument("--no-recursive", action="store_true", help="don't descend into subdirectories")
+    p.add_argument("--log", type=Path, default=default_log_path(),
+                   help="log file (default %(default)s)")
+    p.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            print(f"error: {tool} not found. Install it: sudo apt install ffmpeg  /  sudo pacman -S ffmpeg",
+                  file=sys.stderr)
+            return 2
+    source = args.source.expanduser().resolve()
+    dest = args.dest.expanduser().resolve()
+    if not source.exists():
+        print(f"error: source {source} does not exist", file=sys.stderr)
+        return 2
+    if args.jobs < 1:
+        print("error: --jobs must be at least 1", file=sys.stderr)
+        return 2
+
+    out = Out(None if args.dry_run else args.log)
+    out.say(f"mkv2mp4 {__version__}: {source} -> {dest}", "bold")
+
+    try:
+        encoder = detect_encoder(args.encoder, args.vaapi_device)
+    except RuntimeError as e:
+        out.say(f"error: {e}", "err")
+        return 2
+    out.say(f"video encoder: {encoder}", "dim")
+    dev = args.vaapi_device
+    if encoder == "x264" and os.path.exists(dev) and not os.access(dev, os.R_OK | os.W_OK):
+        out.say(f"hint: no permission for {dev}, so GPU encoding is off. "
+                f"Fix with: sudo usermod -aG render $USER  (then log out and back in)", "warn")
+    has_zscale = has_filter("zscale")
+
+    base = source.parent if source.is_file() else source
+    sources = find_sources(source, not args.no_recursive)
+    if not sources:
+        out.say("no .mkv files to convert")
+        return 0
+
+    plans, skipped, failed = [], 0, []
+    for src in sources:
+        dst = dest / src.relative_to(base).with_suffix(".mp4")
+        if dst.exists() and not args.overwrite:
+            out.say(f"skip {src.relative_to(base)}: {dst.name} already exists in destination", "dim")
+            skipped += 1
+            continue
+        try:
+            plan = make_plan(src, dst, ffprobe(src), args, has_zscale)
+        except (RuntimeError, ValueError, json.JSONDecodeError) as e:
+            out.say(f"skip {src.relative_to(base)}: {e}", "err")
+            failed.append(src.name)
+            continue
+        plans.append(plan)
+
+    if not plans:
+        out.say(f"nothing to do ({skipped} skipped, {len(failed)} unreadable)")
+        return 1 if failed else 0
+
+    for plan in plans:
+        out.log_only(f"plan {plan.src}")
+        if args.dry_run:
+            out.say(f"\n{plan.src.relative_to(base)}", "bold")
+            out.say(f"  -> {plan.dst}")
+            if not args.no_rename:
+                out.say(f"  original renamed to {plan.renamed.name}")
+            out.say(f"  video: {plan.video_desc}")
+            for a in plan.audio:
+                out.say(f"  audio: {a.desc}")
+            for s, path in zip(plan.subs, sidecar_paths(plan)):
+                where = path.name if args.external_subs else "embedded (mov_text)"
+                out.say(f"  subs:  #{s.index} {s.lang} {s.codec} -> {where}")
+            if plan.burn_index is not None:
+                out.say(f"  subs:  #{plan.burn_index} burned into video")
+        for note in plan.notes:
+            out.say(f"  note: {note}" if args.dry_run else f"note ({plan.src.name}): {note}", "warn")
+
+    total_in = sum(p.src.stat().st_size for p in plans)
+    if args.dry_run:
+        n_enc = sum(p.video_encode for p in plans)
+        out.say(f"\n{len(plans)} to convert ({len(plans) - n_enc} remux, {n_enc} re-encode), "
+                f"{skipped} skipped, {fmt_size(total_in)} of input")
+        return 0
+
+    dest.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(dest).free
+    if free < total_in:
+        out.say(f"warning: only {fmt_size(free)} free in destination for {fmt_size(total_in)} of input",
+                "warn")
+
+    runner = Runner(args, encoder, out, len(plans))
+    results = collections.Counter()
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = {pool.submit(runner.run, i, p): p for i, p in enumerate(plans, 1)}
+        try:
+            for fut in as_completed(futures):
+                try:
+                    status = fut.result()
+                except Exception as e:  # keep the batch going if one file blows up
+                    out.say(f"FAILED {futures[fut].src.name}: {e}", "err")
+                    status = "failed"
+                results[status] += 1
+                if status == "failed":
+                    failed.append(futures[fut].src.name)
+        except KeyboardInterrupt:
+            out.say("\ninterrupted: stopping ffmpeg and removing partial files...", "warn")
+            for fut in futures:
+                fut.cancel()
+            runner.kill_all()
+            pool.shutdown(wait=True)
+            return 130
+
+    done = results["remuxed"] + results["encoded"]
+    out.say("")
+    out.say(f"finished in {fmt_time(time.time() - started)}: {done} converted "
+            f"({results['remuxed']} remuxed, {results['encoded']} re-encoded), "
+            f"{skipped} skipped, {len(failed)} failed", "bold")
+    for name in failed:
+        out.say(f"  failed: {name}", "err")
+    if out.log:
+        out.say(f"log: {args.log}", "dim")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,6 @@
+# build output
+dist/
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.pkg.tar.*
+__pycache__/

@@ -1,0 +1,243 @@
+.TH MKV2MP4 1 "October 2026" "mkv2mp4 1.0.0" "User Commands"
+.SH NAME
+mkv2mp4 \- convert MKV files into MP4s that every Jellyfin client can direct play
+.SH SYNOPSIS
+.B mkv2mp4
+.RI [ options ]
+.I source
+.I dest
+.SH DESCRIPTION
+.B mkv2mp4
+scans
+.I source
+for
+.B .mkv
+files and writes a
+.B .mp4
+for each one into
+.IR dest .
+The output plays without server-side transcoding on Jellyfin's web client,
+Roku, Fire TV, Apple TV and Android TV.
+.PP
+For each file
+.IR source / path / name .mkv:
+.IP 1. 4
+.IR dest / path / name .mp4
+is created. Subdirectories are mirrored, so
+.I Show/Season 01/
+keeps the layout Jellyfin expects.
+.IP 2. 4
+Only after the conversion succeeds, the original is renamed in place to
+.IR name .converted.mkv.
+Originals are never deleted.
+.IP 3. 4
+Files already named
+.B *.converted.mkv
+are skipped, so it is safe to run
+.B mkv2mp4
+repeatedly, for example from cron. To convert a file again, rename it back to
+.BR .mkv .
+.PP
+.I source
+may also be a single
+.B .mkv
+file. Hidden files and directories (names starting with a dot) are ignored.
+.SH OUTPUT FORMAT
+.TP
+.B Video
+H.264 High profile, 8-bit 4:2:0.
+Video that is already compatible H.264 is copied unchanged, which is fast and
+lossless. Anything else (HEVC, 10-bit, AV1, MPEG-2, VC-1, ...) is re-encoded.
+HDR (PQ/HLG) is tone-mapped to SDR BT.709, and interlaced video is
+deinterlaced.
+.TP
+.B Audio
+The first track is AAC stereo and is marked default, so every client has
+something it can play. It is made from the source's default audio track.
+AAC, AC3, E-AC3 and MP3 tracks are copied. Other surround tracks (DTS,
+TrueHD, FLAC, PCM, ...) are converted to AC3 at 640 kb/s (7.1 is downmixed to
+5.1). Other stereo or mono tracks become AAC. All languages are kept, and
+converted tracks are titled
+.I "Stereo (AAC)"
+or
+.IR "Surround (AC3)" .
+.TP
+.B Subtitles
+Text subtitles (SRT, ASS/SSA, WebVTT) are embedded as MP4 text tracks
+(ASS styling is lost), or written as sidecar files with
+.BR \-\-external\-subs .
+Image subtitles (PGS, VobSub, DVB) cannot be stored in MP4. They are dropped
+with a warning unless
+.B \-\-burn\-subs
+is given.
+.TP
+.B Other
+Chapters and global metadata are kept. The index is moved to the front of the
+file (faststart) so playback starts immediately.
+.SH OPTIONS
+.TP
+.BR \-n ", " \-\-dry\-run
+Show the plan for every file (what is copied, what is re-encoded, which
+tracks are kept) without converting or renaming anything.
+.TP
+.BR \-j ", " \-\-jobs " \fIN\fR"
+Convert
+.I N
+files in parallel (default 1). Live progress is shown only when
+.I N
+is 1.
+.TP
+.BR \-e ", " \-\-encoder " \fIauto\fR|\fIvaapi\fR|\fInvenc\fR|\fIx264\fR"
+Video encoder. The default,
+.BR auto ,
+test-encodes at startup and picks NVIDIA NVENC, then VAAPI (Intel/AMD), then
+the CPU encoder x264. Naming a GPU encoder that doesn't work is an error.
+.TP
+.BI \-\-vaapi\-device " path"
+VAAPI render node (default
+.IR /dev/dri/renderD128 ).
+.TP
+.BR \-q ", " \-\-quality " \fIN\fR"
+Video quality. Lower is better and bigger. Used as the CRF for x264, CQ for
+NVENC and QP for VAAPI (default 20). Sensible range is 18\(en24.
+.TP
+.BI \-\-preset " name"
+x264 preset (default
+.BR medium ).
+Slower presets give smaller files at the same quality.
+.TP
+.BI \-\-max\-height " px"
+Downscale video taller than
+.I px
+(e.g. 1080). This forces a re-encode. Useful for older Fire TV and Roku
+devices that cannot play 4K H.264.
+.TP
+.B \-\-external\-subs
+Write text subtitles next to the MP4 as
+.IR name . lang [.forced][.default].srt
+(or
+.BR .ass ,
+keeping styling), which Jellyfin picks up automatically, instead of embedding
+them.
+.TP
+.B \-\-burn\-subs
+Burn one image subtitle track into the video: the forced track if there is
+one, otherwise the default track, otherwise the first. This forces a
+re-encode.
+.TP
+.B \-\-no\-rename
+Leave the original filenames unchanged. Later runs will then convert the file
+again unless the MP4 already exists in
+.IR dest .
+.TP
+.B \-\-overwrite
+Replace MP4s that already exist in
+.IR dest .
+Without this they are skipped and the original is left alone.
+.TP
+.B \-\-no\-recursive
+Only process the top level of
+.IR source .
+.TP
+.BI \-\-log " file"
+Append a log, including every ffmpeg command and any errors, to
+.I file
+(default
+.IR ~/.local/state/mkv2mp4/mkv2mp4.log ).
+No log is written for
+.BR \-\-dry\-run .
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.SH SAFETY
+Output is written to a hidden
+.IR . name .mp4.part
+file and renamed only when ffmpeg succeeds. If a conversion fails or is
+interrupted with Ctrl-C, the partial file is removed and the original keeps
+its name, so the next run retries it.
+.PP
+If
+.I dest
+appears to have less free space than the total size of the input, a warning
+is printed but the run continues.
+.SH GPU ENCODING
+GPU encoding is much faster than x264 but is optional.
+.TP
+.B Ubuntu
+Add yourself to the
+.B render
+group
+.RB ( "sudo usermod \-aG render $USER" ,
+then log out and back in) and install
+.B mesa\-va\-drivers
+(AMD) or
+.B intel\-media\-va\-driver
+(Intel).
+.B mkv2mp4
+prints a hint if the render node exists but isn't accessible.
+.TP
+.B Arch
+AMD works with mesa. Intel needs
+.B intel\-media\-driver
+(or
+.B libva\-intel\-driver
+for pre-Broadwell chips). NVIDIA needs
+.BR nvidia\-utils .
+.PP
+The encoder chosen is shown at the start of every run.
+.SH EXIT STATUS
+.TP
+.B 0
+All files converted (or nothing to do).
+.TP
+.B 1
+One or more files failed or could not be read.
+.TP
+.B 2
+Usage error, missing ffmpeg/ffprobe, or a requested encoder is unavailable.
+.TP
+.B 130
+Interrupted.
+.SH EXAMPLES
+Preview what would happen:
+.PP
+.RS
+mkv2mp4 \-n ~/Downloads/rips /srv/jellyfin/Movies
+.RE
+.PP
+Convert, using two parallel jobs on the CPU at a slightly higher quality:
+.PP
+.RS
+mkv2mp4 \-e x264 \-j 2 \-q 19 ~/Downloads/rips /srv/jellyfin/Movies
+.RE
+.PP
+Convert a 4K TV library for older devices, with sidecar subtitles:
+.PP
+.RS
+mkv2mp4 \-\-max\-height 1080 \-\-external\-subs /mnt/rips/TV /srv/jellyfin/TV
+.RE
+.SH NOTES
+If
+.I source
+is inside a Jellyfin library, Jellyfin will also list the
+.B .converted.mkv
+files. Keep
+.I source
+outside your libraries, or move the originals once you are happy with the
+results.
+.SH FILES
+.TP
+.I ~/.local/state/mkv2mp4/mkv2mp4.log
+Default log file
+.RB ( $XDG_STATE_HOME
+is honoured).
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+If set, disables coloured output.
+.SH SEE ALSO
+.BR ffmpeg (1),
+.BR ffprobe (1)

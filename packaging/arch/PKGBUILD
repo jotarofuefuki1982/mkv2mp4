@@ -1,0 +1,26 @@
+# Build and install from this directory with:  makepkg -si
+pkgname=mkv2mp4
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Convert MKV files into MP4s that every Jellyfin client can direct play"
+arch=('any')
+license=('MIT')
+depends=('python' 'ffmpeg')
+optdepends=(
+    'intel-media-driver: GPU encoding on Intel Broadwell and newer'
+    'libva-intel-driver: GPU encoding on older Intel'
+    'nvidia-utils: GPU encoding on NVIDIA (NVENC)'
+)
+
+_srcdir="$startdir/../.."
+
+pkgver() {
+    sed -n 's/^__version__ = "\(.*\)"/\1/p' "$_srcdir/mkv2mp4"
+}
+
+package() {
+    install -Dm755 "$_srcdir/mkv2mp4" "$pkgdir/usr/bin/mkv2mp4"
+    install -Dm644 "$_srcdir/mkv2mp4.1" "$pkgdir/usr/share/man/man1/mkv2mp4.1"
+    install -Dm644 "$_srcdir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 "$_srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
